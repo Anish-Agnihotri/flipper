@@ -1,6 +1,6 @@
 import Flipper from "./flipper"; // Flipper
 import * as dotenv from "dotenv"; // Env vars
-import { logger } from "./logger"; // Logging
+import { logger } from "./utils/logger"; // Logging
 
 // Setup env
 dotenv.config();
@@ -8,16 +8,17 @@ dotenv.config();
 (async () => {
   // Collect environment variables
   const rpcURL: string | undefined = process.env.RPC;
+  const IPFSGateway: string | undefined = process.env.IPFS;
   const contractAddress: string | undefined = process.env.CONTRACT;
 
   // If missing env vars
-  if (!rpcURL || !contractAddress) {
+  if (!rpcURL || !IPFSGateway || !contractAddress) {
     // Throw error and exit
     logger.error("Missing required parameters, update .env");
     process.exit(1);
   }
 
-  // Setup flipper and scrape
-  const flipper = new Flipper(rpcURL, contractAddress);
-  await flipper.scrape();
+  // Setup flipper and process
+  const flipper = new Flipper(rpcURL, IPFSGateway, contractAddress);
+  await flipper.process();
 })();

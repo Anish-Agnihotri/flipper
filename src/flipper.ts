@@ -1,22 +1,13 @@
 import fs from "fs";
 import path from "path";
+import axios from "axios";
 import { ethers } from "ethers";
-import { logger } from "./logger";
-
-enum URIType {
-  IPFS,
-  ARWEAVE,
-  HTTPS,
-}
-
-const IPFSRegex = RegExp("Qm[1-9A-Za-z]{43}[^OIl](/[0-9]+)?");
-const ERC721ABI: string[] = [
-  "function name() external view returns (string memory)",
-  "function totalSupply() external view returns (uint256)",
-  "function tokenURI(uint256) external view returns (string memory)",
-];
+import { logger } from "./utils/logger";
+import { ERC721ABI } from "./utils/constants";
+import { collectURILocation, URILocation } from "./utils/metadata";
 
 export default class Flipper {
+  IPFSGateway: string;
   contractAddress: string;
   contract: ethers.Contract;
 
@@ -26,7 +17,8 @@ export default class Flipper {
   lastScrapedToken: number = 0;
   lastFlippedToken: number = 0;
 
-  constructor(rpcURL: string, contractAddress: string) {
+  constructor(rpcURL: string, IPFSGateway: string, contractAddress: string) {
+    this.IPFSGateway = IPFSGateway;
     this.contractAddress = contractAddress;
     const rpcProvider = new ethers.providers.StaticJsonRpcProvider(rpcURL);
     this.contract = new ethers.Contract(
@@ -36,6 +28,10 @@ export default class Flipper {
     );
   }
 
+  /**
+   * Collects collections name and totalSupply
+   * Modifies collectionName and collectionSupply global variables
+   */
   async collectCollectionDetails(): Promise<void> {
     this.collectionName = await this.contract.name();
     this.collectionSupply = await this.contract.totalSupply();
@@ -45,14 +41,23 @@ export default class Flipper {
     return path.join(__dirname, `../output/${this.contractAddress}/${folder}`);
   }
 
+  /**
+   * Creates necessary folders in directories, as specified
+   * Returns max id of token stored in JSON in full path
+   * @param {string} path partial ("original" || "flipped")
+   * @returns {number} max id of token stored in full path
+   */
   setupDirectoryByType(path: string): number {
-    // Check if metadata images folder exists by path
+    // Collect paths for metadata + images folder
     const metadataFolder: string = this.getDirectoryPath(path);
     const metadataImagesFolder: string = metadataFolder + "/images";
+
+    // Check if metadata images folder exists by path
     if (!fs.existsSync(metadataImagesFolder)) {
       // If does not exist, create folder
       fs.mkdirSync(metadataImagesFolder, { recursive: true });
       logger.info(`Initializing new ${path} metadata + images folder`);
+
       // Return 0 as currently synced index
       return 0;
     } else {
@@ -69,57 +74,42 @@ export default class Flipper {
         // Else, return empty (if not correct extension)
         return [];
       });
+
       // If at least 1 tokenId exists in folder
       if (tokenIds.length > 0) {
-        // Set index to max tokenId and log
-        const index: number = Math.max(...tokenIds);
-        logger.info(`${path} metadata folder exists till token #${index}`);
-        // Return currently synced index
-        return index;
+        // Set max tokenId and log
+        const maxTokenId: number = Math.max(...tokenIds);
+        logger.info(`${path} metadata folder exists till token #${maxTokenId}`);
+
+        // Return max tokenId
+        return maxTokenId;
       } else {
         // Log empty but existing folder
         logger.info(`${path} metadata folder exists but is empty`);
+
         // Return 0 as currently synced index
         return 0;
       }
     }
   }
 
-  collectURIType(URI: string): { type: URIType; URI: string } {
-    // Check if URI is IPFS compatible
-    const isIPFS = URI.match(IPFSRegex);
-    if (isIPFS) {
-      // If so, return truncated IPFS URI
-      return { type: URIType.IPFS, URI: isIPFS[0] };
-    }
-
-    // TODO: Check if URI is Arweave compatible
-
-    // Else, check if URI is https
-    if (URI.includes("https://")) {
-      // Default to HTTPS-type URI
-      return { type: URIType.HTTPS, URI };
-    }
-
-    // If unknown type of URI, throw
-    logger.info("Unsupported URI type: ", URI);
-    process.exit(1);
+  async getHTTPMetadata(uri: string): Promise<Record<any, any>> {
+    const { data } = await axios.get(uri);
+    return data;
   }
 
-  async getIPFSMetadata(cid: string): Promise<JSON> {
-    if (!this.ipfs) {
-      logger.error("IFPS node not started");
-      process.exit(1);
-    }
+  async getAndSaveHTTPImage(uri: string, path: string): Promise<void> {
+    const { data } = await axios.get(uri, { responseType: "stream" });
+    const writer = data.pipe(fs.createWriteStream(path));
+    return new Promise((resolve, reject) => {
+      writer.on("finish", resolve);
+      writer.on("error", reject);
+    });
+  }
 
-    const stream: AsyncIterable<Uint8Array> = this.ipfs.cat(cid);
-
-    let data: string = "";
-    for await (const buffer of stream) {
-      data += buffer;
-    }
-
-    return JSON.parse(data);
+  async getHTTPImage(uri: string): Promise<string> {
+    const { data } = await axios.get(uri, { responseType: "arraybuffer" });
+    return Buffer.from(data, "binary").toString("base64");
   }
 
   async scrapeOriginalToken(tokenId: number): Promise<void> {
@@ -131,36 +121,66 @@ export default class Flipper {
     }
 
     // Collect token URI from contract
-    const retrievedURI: string = await this.contract.tokenURI(tokenId);
-    // Collect type of token URI + formatted URI
-    const { type, URI } = this.collectURIType(retrievedURI);
+    const URI: string = await this.contract.tokenURI(tokenId);
 
-    // Collect metadata based on URI type
-    let metadata: JSON;
-    switch (type) {
+    // Collect location and formatted URI from URI
+    const { loc, URI: formattedURI } = collectURILocation(URI);
+
+    // Collect metadata based on URI location
+    // Could use a ternary and skip the switch, but more maintanable long-term
+    let metadata: Record<any, any> = {};
+    switch (loc) {
       // Case: IPFS
-      case URIType.IPFS:
-        metadata = await this.getIPFSMetadata(URI);
-      // Default case: IPFS
-      default:
-        metadata = await this.getIPFSMetadata(URI);
+      case URILocation.IPFS:
+        metadata = await this.getHTTPMetadata(
+          `${this.IPFSGateway}${formattedURI}`
+        );
+        break;
+      // Case: HTTPS
+      case URILocation.HTTPS:
+        metadata = await this.getHTTPMetadata(formattedURI);
+        break;
     }
 
-    // Get path to original metadata folder
-    const originalMetadataFolder: string = this.getDirectoryPath("original");
-    // Write metadata JSON file for tokenId
-    await fs.writeFileSync(
-      `${originalMetadataFolder}/${tokenId}.json`,
-      JSON.stringify(metadata)
-    );
+    // Get relevant paths
+    const baseFolder: string = this.getDirectoryPath("original");
+    const tokenMetadataPath: string = `${baseFolder}/${tokenId}.json`;
+    const tokenImagePath: string = `${baseFolder}/images/${tokenId}.png`;
+
+    // Write metadata to JSON file
+    await fs.writeFileSync(tokenMetadataPath, JSON.stringify(metadata));
+
+    // If image details exist in retrieved metadata
+    if (metadata["image"]) {
+      // Collect image location and formatted URI
+      const { loc, URI: imageURI } = collectURILocation(metadata["image"]);
+
+      // Save image to disk based on location
+      switch (loc) {
+        // Case: IPFS
+        case URILocation.IPFS:
+          await this.getAndSaveHTTPImage(
+            this.IPFSGateway + imageURI,
+            tokenImagePath
+          );
+          break;
+        // Case: HTTPS
+        case URILocation.HTTPS:
+          await this.getAndSaveHTTPImage(imageURI, tokenImagePath);
+          break;
+      }
+    }
 
     // Log retrieval and process next tokenId
     logger.info(`Retrieved token #${tokenId}`);
     await this.scrapeOriginalToken(tokenId + 1);
   }
 
-  async scrape() {
-    // Collect collection details
+  /**
+   * Processes scraping, flipping, and uploading
+   */
+  async process() {
+    // Collect and log collection details
     await this.collectCollectionDetails();
     logger.info(
       `Scraping ${this.collectionName} collection (supply: ${this.collectionSupply})`
