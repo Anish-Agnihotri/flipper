@@ -1,30 +1,41 @@
-import fs from "fs";
-import path from "path";
-import axios from "axios";
-import { ethers } from "ethers";
-import { logger } from "./utils/logger";
-import { ERC721ABI } from "./utils/constants";
-import { collectURILocation, URILocation } from "./utils/metadata";
+import fs from "fs"; // Filesystem
+import path from "path"; // Path
+import axios from "axios"; // Requests
+import { ethers } from "ethers"; // Ethers
+import { logger } from "./utils/logger"; // Logging
+import { ERC721ABI } from "./utils/constants"; // Constants
+import { collectURILocation, URILocation } from "./utils/metadata"; // Metadata helpers
+import { promptVerifyContinue } from "./utils/prompt";
 
 export default class Flipper {
+  // IPFS Gateway URL
   IPFSGateway: string;
-  contractAddress: string;
+
+  // Collection contract
   contract: ethers.Contract;
 
+  // Collection details
   collectionName: string = "";
   collectionSupply: number = 0;
 
+  // Scraping + flipping status
   lastScrapedToken: number = 0;
   lastFlippedToken: number = 0;
 
+  /**
+   * Initializes Flipper
+   * @param {string} rpcURL to retrieve from
+   * @param {string} IPFSGateway to retrieve from + store to
+   * @param {string} contractAddress of collection
+   */
   constructor(rpcURL: string, IPFSGateway: string, contractAddress: string) {
+    // Update IPFS Gateway
     this.IPFSGateway = IPFSGateway;
-    this.contractAddress = contractAddress;
-    const rpcProvider = new ethers.providers.StaticJsonRpcProvider(rpcURL);
+    // Initialize collection contract
     this.contract = new ethers.Contract(
       contractAddress,
       ERC721ABI,
-      rpcProvider
+      new ethers.providers.StaticJsonRpcProvider(rpcURL)
     );
   }
 
@@ -37,8 +48,14 @@ export default class Flipper {
     this.collectionSupply = await this.contract.totalSupply();
   }
 
+  /**
+   * Generates directory path based on collection contract address and subpath folder
+   * @param {string} folder subpath to append ("original" || "flipped")
+   * @returns {string} formatted directory full path
+   */
   getDirectoryPath(folder: string): string {
-    return path.join(__dirname, `../output/${this.contractAddress}/${folder}`);
+    // `~/output/0x.../(original || flipped)`
+    return path.join(__dirname, `../output/${this.contract.address}/${folder}`);
   }
 
   /**
@@ -93,25 +110,39 @@ export default class Flipper {
     }
   }
 
+  /**
+   * Collects metadata from HTTP(s) url (expects JSON response)
+   * @param {string} uri to retrieve from
+   * @returns {Promise<Record<any, any>>} JSON response
+   */
   async getHTTPMetadata(uri: string): Promise<Record<any, any>> {
     const { data } = await axios.get(uri);
     return data;
   }
 
+  /**
+   * Collects image from URI, saves to path
+   * @param {string} uri to retrieve image from
+   * @param {string} path to save image to
+   */
   async getAndSaveHTTPImage(uri: string, path: string): Promise<void> {
+    // Collect image from URI as a stream
     const { data } = await axios.get(uri, { responseType: "stream" });
+    // Pipe stream to a writeable fs stream
     const writer = data.pipe(fs.createWriteStream(path));
+    // Appropriately convert writer response to a promise
     return new Promise((resolve, reject) => {
       writer.on("finish", resolve);
       writer.on("error", reject);
     });
   }
 
-  async getHTTPImage(uri: string): Promise<string> {
-    const { data } = await axios.get(uri, { responseType: "arraybuffer" });
-    return Buffer.from(data, "binary").toString("base64");
-  }
-
+  /**
+   * Scrapes tokenId of contract
+   * Saves metadata to /output/original/{tokenId}.json
+   * Saves image to /output/original/images/{tokenId}.png
+   * @param {number} tokenId to scrape
+   */
   async scrapeOriginalToken(tokenId: number): Promise<void> {
     // If token to scrape >= total supply
     if (tokenId >= this.collectionSupply) {
@@ -193,8 +224,15 @@ export default class Flipper {
 
     // Scrape original token metadata
     await this.scrapeOriginalToken(this.lastScrapedToken + 1);
+    logger.info("Finished scraping original token metadata.");
 
-    // Post-processing (flip images in metadata)
+    // Post-processing (move metadata and flip images)
+
+    // Post-processing (give time to make manual modifications)
+    await promptVerifyContinue(
+      "You can make modify the flipped metadata now. Continue? (true/false)"
+    );
+
     // Upload new metadata to IPFS
     // Log and save useful metadata details
   }
