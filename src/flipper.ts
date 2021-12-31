@@ -1,4 +1,5 @@
 import fs from "fs"; // Filesystem
+import Jimp from "jimp"; // Image manipulation
 import path from "path"; // Path
 import axios from "axios"; // Requests
 import { ethers } from "ethers"; // Ethers
@@ -208,6 +209,37 @@ export default class Flipper {
   }
 
   /**
+   * Until parity between scraped and flipped tokens, copy metadata and flip images
+   */
+  async postProcess(lastFlipped: number): Promise<void> {
+    // If tokens to flip >= scraped tokens
+    if (lastFlipped >= this.lastScrapedToken) {
+      // Revert with finished log
+      logger.info("Finished generating flipped metadata");
+      return;
+    }
+
+    // Collect folders
+    const srcFolder: string = this.getDirectoryPath("original");
+    const destFolder: string = this.getDirectoryPath("flipped");
+
+    // Copy metadata JSON from src to dest
+    await fs.copyFileSync(
+      `${srcFolder}/${lastFlipped}.json`,
+      `${destFolder}/${lastFlipped}.json`
+    );
+
+    // Read metadata image from src
+    const image = await Jimp.read(`${srcFolder}/images/${lastFlipped}.png`);
+    // Flip image horizontally and save to dest
+    image.flip(true, false).write(`${destFolder}/images/${lastFlipped}.png`);
+
+    // Log flip and process next tokenId
+    logger.info(`Flipped token #${lastFlipped}`);
+    await this.postProcess(lastFlipped + 1);
+  }
+
+  /**
    * Processes scraping, flipping, and uploading
    */
   async process() {
@@ -224,9 +256,9 @@ export default class Flipper {
 
     // Scrape original token metadata
     await this.scrapeOriginalToken(this.lastScrapedToken + 1);
-    logger.info("Finished scraping original token metadata.");
 
     // Post-processing (move metadata and flip images)
+    await this.postProcess(this.lastFlippedToken + 1);
 
     // Post-processing (give time to make manual modifications)
     await promptVerifyContinue(
