@@ -9,3 +9,6 @@ node_modules/
 
 # Built files
 dist/
+
+# Ouput files
+output/
