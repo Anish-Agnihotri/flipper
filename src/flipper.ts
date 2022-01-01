@@ -3,10 +3,11 @@ import Jimp from "jimp"; // Image manipulation
 import path from "path"; // Path
 import axios from "axios"; // Requests
 import { ethers } from "ethers"; // Ethers
+import FormData from "form-data"; // Data sending
 import { logger } from "./utils/logger"; // Logging
 import { ERC721ABI } from "./utils/constants"; // Constants
+import { promptVerifyContinue } from "./utils/prompt"; // Prompt
 import { collectURILocation, URILocation } from "./utils/metadata"; // Metadata helpers
-import { promptVerifyContinue } from "./utils/prompt";
 
 export default class Flipper {
   // IPFS Gateway URL
@@ -23,13 +24,22 @@ export default class Flipper {
   lastScrapedToken: number = 0;
   lastFlippedToken: number = 0;
 
+  // Pinata API
+  pinataJWT: string | undefined;
+
   /**
    * Initializes Flipper
    * @param {string} rpcURL to retrieve from
    * @param {string} IPFSGateway to retrieve from + store to
    * @param {string} contractAddress of collection
+   * @param {string | undefined} pinataJWT optional token
    */
-  constructor(rpcURL: string, IPFSGateway: string, contractAddress: string) {
+  constructor(
+    rpcURL: string,
+    IPFSGateway: string,
+    contractAddress: string,
+    pinataJWT: string | undefined
+  ) {
     // Update IPFS Gateway
     this.IPFSGateway = IPFSGateway;
     // Initialize collection contract
@@ -38,6 +48,8 @@ export default class Flipper {
       ERC721ABI,
       new ethers.providers.StaticJsonRpcProvider(rpcURL)
     );
+    // Update optional Pinata credentials
+    this.pinataJWT = pinataJWT;
   }
 
   /**
@@ -213,7 +225,7 @@ export default class Flipper {
    */
   async postProcess(lastFlipped: number): Promise<void> {
     // If tokens to flip >= scraped tokens
-    if (lastFlipped >= this.lastScrapedToken) {
+    if (lastFlipped > this.lastScrapedToken) {
       // Revert with finished log
       logger.info("Finished generating flipped metadata");
       return;
@@ -237,6 +249,118 @@ export default class Flipper {
     // Log flip and process next tokenId
     logger.info(`Flipped token #${lastFlipped}`);
     await this.postProcess(lastFlipped + 1);
+  }
+
+  /**
+   * Given a path to a folder and filetype, filter for all files of filetype
+   * Then, if preprocessor provided, process all files of filetype
+   * Else, push all files to a form data and publish to IPFS
+   * @param {string} path of folder
+   * @param {string} filetype to filter
+   * @param {string} token Pinata JWT
+   * @param {Function?} customPreProcess optional preprocesser for files
+   * @returns {Promise<string>} IPFS hash of uploaded content
+   */
+  async pinContent(
+    path: string,
+    filetype: string,
+    token: string,
+    customPreProcess?: Function
+  ): Promise<string> {
+    // Collect all files at path
+    const filenames: string[] = fs.readdirSync(path);
+    // Filter all files for filetype
+    const files: string[] = filenames.filter((filename: string) =>
+      filename.endsWith(filetype)
+    );
+
+    // Setup data to post
+    const formData = new FormData();
+    // Push files to data
+    for (const file of files) {
+      // Run custom processing for each file, if provided
+      if (customPreProcess) {
+        await customPreProcess(file, path);
+      }
+
+      formData.append("file", fs.createReadStream(`${path}/${file}`), {
+        // Truncate filepath to just name
+        filepath: `output/${file}`
+      });
+    }
+
+    // Post data
+    const {
+      // And collect IpfsHash of directory
+      data: { IpfsHash }
+    }: { data: { IpfsHash: string } } = await axios.post(
+      // Post pinFileToIPFS
+      "https://api.pinata.cloud/pinning/pinFileToIPFS",
+      // With bulk data
+      formData,
+      {
+        // Overload max body to allow infinite images
+        maxBodyLength: Infinity,
+        headers: {
+          "Content-Type": `multipart/form-data; boundary=${formData.getBoundary()}`,
+          Authorization: `Bearer ${token}`
+        }
+      }
+    );
+
+    // Return directory
+    return IpfsHash;
+  }
+
+  /**
+   * Given a file path + name and IPFS image hash, modifies image path in file
+   * @param {string} imageHash of flipped images
+   * @param {string} filename of JSON metadata
+   * @param {string} path to JSON metadata
+   */
+  async processJSON(
+    imageHash: string,
+    filename: string,
+    path: string
+  ): Promise<void> {
+    // Read file
+    const file: Buffer = await fs.readFileSync(`${path}/${filename}`);
+    // Read data in file
+    const data = JSON.parse(file.toString());
+    // Overrwrite file with new image data
+    await fs.writeFileSync(
+      `${path}/${filename}`,
+      JSON.stringify({
+        ...data,
+        // Overwrite image key with "ipfs://hash/tokenId"
+        image: `ipfs://${imageHash}/${filename.slice(0, -5)}.png`
+      })
+    );
+  }
+
+  /**
+   * Uploads flipped metadata to IPFS
+   * @param {string} token Pinata JWT
+   */
+  async uploadMetadata(token: string): Promise<void> {
+    // Collect paths
+    const jsonPath: string = this.getDirectoryPath("flipped");
+    const imagePath: string = `${jsonPath}/images`;
+
+    // Upload images to IPFS and log
+    const imageHash: string = await this.pinContent(imagePath, ".png", token);
+    logger.info(`Uploaded images to ipfs://${imageHash}`);
+
+    // Upload metadata to IPFS and log
+    const finalHash: string = await this.pinContent(
+      jsonPath,
+      ".json",
+      token,
+      // Custom parser to modify image path in JSON files
+      async (filename: string, path: string) =>
+        this.processJSON(imageHash, filename, path)
+    );
+    logger.info(`Uploaded metadata to ipfs://${finalHash}`);
   }
 
   /**
@@ -265,7 +389,10 @@ export default class Flipper {
       "You can make modify the flipped metadata now. Continue? (true/false)"
     );
 
-    // Upload new metadata to IPFS
-    // Log and save useful metadata details
+    // If provided Pinata token
+    if (this.pinataJWT) {
+      // Upload new metadata to IPFS
+      await this.uploadMetadata(this.pinataJWT);
+    }
   }
 }
